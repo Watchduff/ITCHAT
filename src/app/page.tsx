@@ -1,8 +1,18 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback, useMemo, FormEvent, ChangeEvent, DragEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
+import {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  useMemo,
+  FormEvent,
+  ChangeEvent,
+  DragEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+} from 'react';
 import { useChat } from '@ai-sdk/react';
-import { DefaultChatTransport, type UIMessage } from 'ai';
+import { DefaultChatTransport, type FileUIPart, type UIMessage } from 'ai';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
@@ -13,7 +23,6 @@ import {
   Send,
   Loader2,
   LifeBuoy,
-  FileUp,
   ThumbsUp,
   ThumbsDown,
   Meh,
@@ -25,10 +34,9 @@ import {
   Briefcase,
   Wifi,
   KeyRound,
-  FileText,
   CircleAlert,
   RotateCcw,
-  CloudUpload,
+  ImagePlus,
 } from 'lucide-react';
 import { FEEDBACK_REASONS, MAX_FEEDBACK_COMMENT_LENGTH, type FeedbackRating } from '@/lib/feedback';
 
@@ -36,16 +44,6 @@ interface Conversation {
   id: string;
   title: string;
   createdAt: string;
-}
-
-interface DocumentRow {
-  id: string;
-  filename: string;
-  fileType: string;
-  status: 'processing' | 'ready' | 'failed';
-  chunkCount: number;
-  errorMessage: string | null;
-  uploadedAt: string;
 }
 
 const SUGGESTIONS = [
@@ -73,6 +71,39 @@ function messageText(message: UIMessage): string {
     .trim();
 }
 
+function messageImages(message: UIMessage): FileUIPart[] {
+  return message.parts.filter(
+    (part): part is FileUIPart => part.type === 'file' && part.mediaType.startsWith('image/')
+  );
+}
+
+const MAX_ATTACHMENTS = 4;
+const MAX_IMAGE_DIMENSION = 1600;
+// Past this size a PNG screenshot is re-encoded as JPEG to keep requests light.
+const MAX_PNG_DATA_URL_LENGTH = 1_500_000;
+const ACCEPTED_IMAGE_TYPES = 'image/png,image/jpeg,image/gif,image/webp';
+
+// Downscale in the browser so a 4K screenshot doesn't become a multi-megabyte request
+// on every turn; the model reads error dialogs fine at this size.
+async function imageToAttachment(file: File): Promise<FileUIPart> {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, MAX_IMAGE_DIMENSION / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(bitmap.width * scale);
+  canvas.height = Math.round(bitmap.height * scale);
+  canvas.getContext('2d')!.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+
+  // Screenshots are mostly flat UI and text, which PNG keeps crisp; photos fall back to JPEG.
+  let mediaType = 'image/png';
+  let url = canvas.toDataURL(mediaType);
+  if (url.length > MAX_PNG_DATA_URL_LENGTH) {
+    mediaType = 'image/jpeg';
+    url = canvas.toDataURL(mediaType, 0.85);
+  }
+  return { type: 'file', mediaType, url, filename: file.name || 'screenshot' };
+}
+
 const DATE_BUCKET_ORDER = ['Today', 'Yesterday', 'Previous 7 days', 'Previous 30 days', 'Older'] as const;
 
 function dateBucket(createdAt: string): (typeof DATE_BUCKET_ORDER)[number] {
@@ -95,7 +126,6 @@ export default function Home() {
   const [conversationsLoaded, setConversationsLoaded] = useState(false);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [docsModalOpen, setDocsModalOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   // Delete is two clicks: the first arms it, the second (within a few seconds) confirms.
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
@@ -233,12 +263,6 @@ export default function Home() {
             <Plus size={16} /> New chat
           </button>
 
-          <button
-            onClick={() => setDocsModalOpen(true)}
-            className="w-full flex items-center gap-2 rounded-lg text-muted hover:text-fg hover:bg-elevated px-3 py-2 text-sm transition-colors"
-          >
-            <FileUp size={14} /> Manage internal docs
-          </button>
 
           <div className="relative">
             <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-faint pointer-events-none" />
@@ -366,190 +390,7 @@ export default function Home() {
         )}
       </div>
 
-      {docsModalOpen && <DocumentsModal onClose={() => setDocsModalOpen(false)} />}
     </div>
-  );
-}
-
-function DocumentsModal({ onClose }: { onClose: () => void }) {
-  const [docs, setDocs] = useState<DocumentRow[]>([]);
-  const [uploading, setUploading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [dragging, setDragging] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
-  async function refresh() {
-    const res = await fetch('/api/documents');
-    setDocs(await res.json());
-  }
-
-  useEffect(() => {
-    (async () => {
-      const res = await fetch('/api/documents');
-      setDocs(await res.json());
-    })();
-  }, []);
-
-  useEffect(() => {
-    function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape') onClose();
-    }
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
-
-  function handleFileChange(e: ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (file) upload(file);
-  }
-
-  function handleDrop(e: DragEvent<HTMLLabelElement>) {
-    e.preventDefault();
-    setDragging(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file && !uploading) upload(file);
-  }
-
-  async function upload(file: File) {
-    setUploading(true);
-    setError(null);
-    try {
-      const formData = new FormData();
-      formData.append('file', file);
-      const res = await fetch('/api/documents', { method: 'POST', body: formData });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || 'Upload failed.');
-      await refresh();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Upload failed.');
-    } finally {
-      setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
-    }
-  }
-
-  async function handleDelete(id: string) {
-    setDocs((prev) => prev.filter((d) => d.id !== id));
-    await fetch(`/api/documents/${id}`, { method: 'DELETE' });
-  }
-
-  return (
-    <div className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={onClose}>
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="docs-modal-title"
-        className="bg-surface border border-line rounded-2xl w-full max-w-lg max-h-[80vh] flex flex-col shadow-2xl shadow-black/50 animate-pop-in"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="p-5 border-b border-line flex items-start justify-between gap-3 shrink-0">
-          <div>
-            <h2 id="docs-modal-title" className="font-semibold text-fg">Internal runbooks & docs</h2>
-            <p className="text-xs text-muted mt-0.5">
-              Anything you add here helps the assistant give better, more specific answers.
-            </p>
-          </div>
-          <button
-            onClick={onClose}
-            aria-label="Close"
-            className="p-1 rounded-md text-faint hover:text-fg hover:bg-elevated"
-          >
-            <X size={18} />
-          </button>
-        </div>
-
-        <div className="p-5 border-b border-line shrink-0">
-          <label
-            onDragOver={(e) => {
-              e.preventDefault();
-              if (!uploading) setDragging(true);
-            }}
-            onDragLeave={() => setDragging(false)}
-            onDrop={handleDrop}
-            className={`flex flex-col items-center justify-center gap-1.5 border-2 border-dashed rounded-xl py-6 text-sm transition-colors ${
-              dragging ? 'border-accent-text bg-accent/10 text-accent-text' : 'border-line-strong text-muted'
-            } ${uploading ? 'opacity-60' : 'cursor-pointer hover:border-accent-text/70 hover:text-fg hover:bg-elevated/50'}`}
-          >
-            {uploading ? <Loader2 size={22} className="animate-spin" /> : <CloudUpload size={22} />}
-            <span className="font-medium">
-              {uploading ? 'Uploading & indexing…' : dragging ? 'Drop it here' : 'Drag a file here, or click to browse'}
-            </span>
-            {!uploading && <span className="text-xs text-faint">PDF, Word, Excel, or CSV</span>}
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".pdf,.docx,.xlsx,.xls,.csv"
-              className="hidden"
-              onChange={handleFileChange}
-              disabled={uploading}
-            />
-          </label>
-          {error && <p className="text-xs text-red-400 mt-2">{error}</p>}
-        </div>
-
-        <div className="flex-1 overflow-y-auto p-2">
-          {docs.length === 0 ? (
-            <div className="text-center py-8 px-4">
-              <FileText size={28} className="mx-auto text-line-strong" />
-              <p className="text-sm text-muted mt-2">No documents yet</p>
-              <p className="text-xs text-faint mt-1">Upload your first runbook to get started.</p>
-            </div>
-          ) : (
-            docs.map((d) => (
-              <div
-                key={d.id}
-                className="group flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-elevated text-sm"
-              >
-                <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-elevated text-muted shrink-0">
-                  <FileText size={16} />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <p className="truncate font-medium text-fg" title={d.filename}>
-                    {d.filename}
-                  </p>
-                  {d.status === 'failed' ? (
-                    <p className="text-xs text-red-400 truncate" title={d.errorMessage ?? undefined}>
-                      {d.errorMessage || 'Something went wrong while indexing.'}
-                    </p>
-                  ) : (
-                    d.status === 'ready' && (
-                      <p className="text-xs text-faint">
-                        {d.chunkCount} section{d.chunkCount === 1 ? '' : 's'} indexed
-                      </p>
-                    )
-                  )}
-                </div>
-                <DocStatusBadge status={d.status} />
-                <button
-                  type="button"
-                  onClick={() => handleDelete(d.id)}
-                  aria-label={`Delete ${d.filename}`}
-                  title="Delete document"
-                  className="p-1.5 rounded-md text-faint opacity-60 group-hover:opacity-100 hover:text-red-400 hover:bg-red-500/10 transition-colors shrink-0"
-                >
-                  <Trash2 size={14} />
-                </button>
-              </div>
-            ))
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-const DOC_STATUS_STYLES: Record<DocumentRow['status'], { label: string; className: string }> = {
-  processing: { label: 'Processing', className: 'bg-amber-500/10 text-amber-300 ring-amber-500/25' },
-  ready: { label: 'Ready', className: 'bg-emerald-500/10 text-emerald-300 ring-emerald-500/25' },
-  failed: { label: 'Failed', className: 'bg-red-500/10 text-red-300 ring-red-500/25' },
-};
-
-function DocStatusBadge({ status }: { status: DocumentRow['status'] }) {
-  const { label, className } = DOC_STATUS_STYLES[status];
-  return (
-    <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ring-1 ring-inset ${className}`}>
-      {label}
-    </span>
   );
 }
 
@@ -751,8 +592,13 @@ function ChatPanel({
   onExchangeComplete: () => void;
 }) {
   const [input, setInput] = useState('');
+  const [attachments, setAttachments] = useState<FileUIPart[]>([]);
+  const [attachError, setAttachError] = useState<string | null>(null);
+  const [draggingImage, setDraggingImage] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const prevStatusRef = useRef<string>('ready');
   const [feedbackKey, setFeedbackKey] = useState<string | null>(null);
   // Tied to the message the replies answer, so replies for an older turn never linger.
@@ -850,15 +696,101 @@ function ChatPanel({
   const send = useCallback(
     (text: string) => {
       const trimmed = text.trim();
-      if (!trimmed || isBusy) return;
+      if ((!trimmed && attachments.length === 0) || isBusy) return;
       setFeedbackKey(null);
       if (error) clearError();
-      sendMessage({ text: trimmed });
+      const files = attachments.length > 0 ? attachments : undefined;
+      if (trimmed) {
+        sendMessage({ text: trimmed, files });
+      } else {
+        sendMessage({ files: attachments });
+      }
       setInput('');
+      setAttachments([]);
+      setAttachError(null);
       textareaRef.current?.focus();
     },
-    [isBusy, sendMessage, error, clearError]
+    [isBusy, sendMessage, error, clearError, attachments]
   );
+
+  const addImages = useCallback(
+    async (files: File[]) => {
+      const images = files.filter((f) => f.type.startsWith('image/'));
+      if (images.length === 0) {
+        if (files.length > 0) setAttachError('Only images can be attached.');
+        return;
+      }
+      const room = MAX_ATTACHMENTS - attachments.length;
+      if (room <= 0) {
+        setAttachError(`You can attach up to ${MAX_ATTACHMENTS} images per message.`);
+        return;
+      }
+
+      const converted: FileUIPart[] = [];
+      for (const file of images.slice(0, room)) {
+        try {
+          converted.push(await imageToAttachment(file));
+        } catch {
+          setAttachError(`Couldn't read ${file.name || 'that image'}.`);
+        }
+      }
+      setAttachError(images.length > room ? `Only ${MAX_ATTACHMENTS} images fit in one message.` : null);
+      setAttachments((prev) => [...prev, ...converted].slice(0, MAX_ATTACHMENTS));
+      textareaRef.current?.focus();
+    },
+    [attachments.length]
+  );
+
+  // Ctrl+V a screenshot anywhere in the chat attaches it (other text fields keep normal paste).
+  useEffect(() => {
+    function handlePaste(e: ClipboardEvent) {
+      const target = e.target as HTMLElement | null;
+      const isOtherField =
+        target !== textareaRef.current &&
+        (target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable);
+      if (isOtherField || !e.clipboardData) return;
+
+      const images = Array.from(e.clipboardData.files).filter((f) => f.type.startsWith('image/'));
+      if (images.length === 0) return;
+      // Keep any text that came along; only suppress the paste when it's purely an image.
+      if (!e.clipboardData.getData('text/plain')) e.preventDefault();
+      addImages(images);
+    }
+    window.addEventListener('paste', handlePaste);
+    return () => window.removeEventListener('paste', handlePaste);
+  }, [addImages]);
+
+  useEffect(() => {
+    if (!previewUrl) return;
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') setPreviewUrl(null);
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [previewUrl]);
+
+  function handleFilePick(e: ChangeEvent<HTMLInputElement>) {
+    addImages(Array.from(e.target.files ?? []));
+    e.target.value = '';
+  }
+
+  function handleDragOver(e: DragEvent<HTMLDivElement>) {
+    if (!Array.from(e.dataTransfer.types).includes('Files')) return;
+    e.preventDefault();
+    setDraggingImage(true);
+  }
+
+  function handleDragLeave(e: DragEvent<HTMLDivElement>) {
+    // Ignore leave events fired when moving between child elements.
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+    setDraggingImage(false);
+  }
+
+  function handleDrop(e: DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    setDraggingImage(false);
+    addImages(Array.from(e.dataTransfer.files));
+  }
 
   // Number-key shortcuts for the quick-reply chips, so a technician mid-call never
   // has to reach for the mouse. Digits are ignored while the technician is actually
@@ -904,7 +836,19 @@ function ChatPanel({
   }
 
   return (
-    <>
+    <div
+      className="relative flex-1 flex flex-col min-h-0"
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {draggingImage && (
+        <div className="pointer-events-none absolute inset-3 z-20 flex flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-accent-text/60 bg-canvas/85 text-accent-text">
+          <ImagePlus size={28} />
+          <p className="text-sm font-medium">Drop screenshots to attach</p>
+        </div>
+      )}
+
       <main className="flex-1 overflow-y-auto px-4 py-6">
         {messages.length === 0 ? (
           <div className="max-w-2xl mx-auto text-center mt-10 sm:mt-20 animate-fade-in-up">
@@ -947,6 +891,7 @@ function ChatPanel({
               const isUser = m.role === 'user';
               const text = messageText(m);
               const isStreamingThis = isBusy && m.id === lastMessage?.id && !isUser;
+              const images = messageImages(m);
               // An assistant turn with no text yet is covered by the typing indicator below.
               if (!isUser && !text) return null;
               return (
@@ -956,25 +901,47 @@ function ChatPanel({
                 >
                   {isUser ? <UserAvatar /> : <AssistantAvatar />}
                   <div className={`flex flex-col min-w-0 max-w-[85%] ${isUser ? 'items-end' : 'items-start'}`}>
-                    <div
-                      className={`rounded-2xl px-4 py-2.5 text-sm ${
-                        isUser
-                          ? 'bg-elevated text-fg border border-line-strong rounded-tr-md whitespace-pre-wrap'
-                          : 'bg-surface border border-line rounded-tl-md prose prose-sm prose-invert max-w-none prose-p:text-fg prose-li:text-fg prose-strong:text-white prose-a:text-accent-text prose-a:no-underline hover:prose-a:underline prose-code:text-accent-text prose-code:before:content-none prose-code:after:content-none prose-pre:bg-canvas prose-pre:border prose-pre:border-line prose-hr:border-line prose-th:text-fg prose-td:border-line'
-                      }`}
-                    >
-                      {m.parts.map((part, i) =>
-                        part.type === 'text' ? (
-                          isUser ? (
-                            <span key={i}>{part.text}</span>
-                          ) : (
-                            <ReactMarkdown key={i} remarkPlugins={[remarkGfm]}>
-                              {part.text}
-                            </ReactMarkdown>
-                          )
-                        ) : null
-                      )}
-                    </div>
+                    {images.length > 0 && (
+                      <div className={`flex flex-wrap gap-2 mb-1.5 ${isUser ? 'justify-end' : ''}`}>
+                        {images.map((img, i) => (
+                          <button
+                            key={i}
+                            type="button"
+                            onClick={() => setPreviewUrl(img.url)}
+                            className="block overflow-hidden rounded-xl border border-line-strong hover:border-accent-text/60 transition-colors"
+                            title="View full size"
+                          >
+                            {/* eslint-disable-next-line @next/next/no-img-element -- data URLs, nothing to optimize */}
+                            <img
+                              src={img.url}
+                              alt={img.filename ? `Attached: ${img.filename}` : 'Attached screenshot'}
+                              className="max-h-48 max-w-[16rem] object-contain bg-canvas"
+                            />
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    {(text || !isUser) && (
+                      <div
+                        className={`rounded-2xl px-4 py-2.5 text-sm ${
+                          isUser
+                            ? 'bg-elevated text-fg border border-line-strong rounded-tr-md whitespace-pre-wrap'
+                            : 'bg-surface border border-line rounded-tl-md prose prose-sm prose-invert max-w-none prose-p:text-fg prose-li:text-fg prose-strong:text-white prose-a:text-accent-text prose-a:no-underline hover:prose-a:underline prose-code:text-accent-text prose-code:before:content-none prose-code:after:content-none prose-pre:bg-canvas prose-pre:border prose-pre:border-line prose-hr:border-line prose-th:text-fg prose-td:border-line'
+                        }`}
+                      >
+                        {m.parts.map((part, i) =>
+                          part.type === 'text' ? (
+                            isUser ? (
+                              <span key={i}>{part.text}</span>
+                            ) : (
+                              <ReactMarkdown key={i} remarkPlugins={[remarkGfm]}>
+                                {part.text}
+                              </ReactMarkdown>
+                            )
+                          ) : null
+                        )}
+                      </div>
+                    )}
                     {!isUser && text && !isStreamingThis && (
                       <div className="mt-1">
                         <CopyButton text={text} />
@@ -1066,35 +1033,103 @@ function ChatPanel({
         )}
 
         <form onSubmit={handleSubmit} className="px-3 pt-3 pb-2">
-          <div className="max-w-3xl mx-auto flex items-end gap-2 rounded-2xl border border-line-strong bg-surface pl-4 pr-1.5 py-1.5 shadow-lg shadow-black/30 focus-within:border-accent-text/50 focus-within:ring-2 focus-within:ring-accent/20 transition-shadow">
-            <textarea
-              ref={textareaRef}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleInputKeyDown}
-              rows={1}
-              autoFocus
-              placeholder={
-                messages.length === 0 ? 'What is the caller running into?' : 'Add details or ask a follow-up…'
-              }
-              aria-label="Message"
-              className="flex-1 resize-none bg-transparent py-2 text-sm leading-relaxed text-fg focus:outline-none placeholder:text-faint"
-            />
-            <button
-              type="submit"
-              disabled={isBusy || !input.trim()}
-              className="bg-accent text-white rounded-xl p-2.5 disabled:bg-elevated disabled:text-faint hover:bg-accent-hover transition-colors shrink-0"
-              aria-label="Send message"
-            >
-              {isBusy ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
-            </button>
+          <div className="max-w-3xl mx-auto rounded-2xl border border-line-strong bg-surface shadow-lg shadow-black/30 focus-within:border-accent-text/50 focus-within:ring-2 focus-within:ring-accent/20 transition-shadow">
+            {attachments.length > 0 && (
+              <div className="flex flex-wrap gap-2 px-3 pt-3">
+                {attachments.map((a, i) => (
+                  <div key={i} className="group relative">
+                    <button
+                      type="button"
+                      onClick={() => setPreviewUrl(a.url)}
+                      className="block h-16 w-16 overflow-hidden rounded-lg border border-line-strong"
+                      title="Preview"
+                    >
+                      {/* eslint-disable-next-line @next/next/no-img-element -- data URLs, nothing to optimize */}
+                      <img src={a.url} alt={a.filename ?? 'Screenshot to send'} className="h-full w-full object-cover" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
+                      aria-label="Remove image"
+                      className="absolute -top-1.5 -right-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-elevated border border-line-strong text-muted hover:text-fg hover:bg-red-500/80"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="flex items-end gap-1 pl-1.5 pr-1.5 py-1.5">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={attachments.length >= MAX_ATTACHMENTS}
+                aria-label="Attach screenshot"
+                title="Attach screenshot (or paste with Ctrl+V)"
+                className="shrink-0 rounded-xl p-2.5 text-muted hover:text-fg hover:bg-elevated disabled:opacity-40 transition-colors"
+              >
+                <ImagePlus size={18} />
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept={ACCEPTED_IMAGE_TYPES}
+                multiple
+                className="hidden"
+                onChange={handleFilePick}
+              />
+              <textarea
+                ref={textareaRef}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleInputKeyDown}
+                rows={1}
+                autoFocus
+                placeholder={
+                  messages.length === 0
+                    ? 'What is the caller running into? You can paste a screenshot too'
+                    : 'Add details, a screenshot, or ask a follow-up…'
+                }
+                aria-label="Message"
+                className="flex-1 resize-none bg-transparent px-1 py-2 text-sm leading-relaxed text-fg focus:outline-none placeholder:text-faint"
+              />
+              <button
+                type="submit"
+                disabled={isBusy || (!input.trim() && attachments.length === 0)}
+                className="bg-accent text-white rounded-xl p-2.5 disabled:bg-elevated disabled:text-faint hover:bg-accent-hover transition-colors shrink-0"
+                aria-label="Send message"
+              >
+                {isBusy ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
+              </button>
+            </div>
           </div>
+          {attachError && <p className="max-w-3xl mx-auto mt-1.5 text-xs text-red-400">{attachError}</p>}
           <p className="max-w-3xl mx-auto mt-2 text-center text-[11px] text-faint">
             <kbd className="font-sans">Enter</kbd> to send · <kbd className="font-sans">Shift + Enter</kbd> for a new
-            line · Always double-check steps before sharing with a caller
+            line · Paste or drop screenshots · Always double-check steps before sharing with a caller
           </p>
         </form>
       </div>
-    </>
+
+      {previewUrl && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 animate-pop-in"
+          onClick={() => setPreviewUrl(null)}
+          role="dialog"
+          aria-label="Image preview"
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element -- data URLs, nothing to optimize */}
+          <img src={previewUrl} alt="Screenshot preview" className="max-h-[90vh] max-w-full rounded-lg shadow-2xl" />
+          <button
+            type="button"
+            onClick={() => setPreviewUrl(null)}
+            aria-label="Close preview"
+            className="absolute top-4 right-4 rounded-full bg-elevated/90 p-2 text-fg hover:bg-elevated"
+          >
+            <X size={18} />
+          </button>
+        </div>
+      )}
+    </div>
   );
 }

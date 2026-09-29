@@ -1,5 +1,5 @@
 import {
-  customType, integer, serial, text,
+  customType, integer, jsonb, serial, text,
   timestamp, uuid
 } from 'drizzle-orm/pg-core';
 import { pgTable } from 'drizzle-orm/pg-core';
@@ -59,6 +59,12 @@ export const conversations = pgTable('conversations', {
   createdAt: timestamp('created_at').defaultNow(),
 });
 
+export interface ChatAttachment {
+  mediaType: string;
+  url: string;
+  filename?: string;
+}
+
 // Individual chat messages
 export const chatMessages = pgTable('chat_messages', {
   id: serial('id').primaryKey(),
@@ -67,6 +73,8 @@ export const chatMessages = pgTable('chat_messages', {
     .references(() => conversations.id, { onDelete: 'cascade' }),
   role: text('role').notNull(),
   content: text('content').notNull(),
+  // Images the technician pasted or attached (screenshots), as data URLs.
+  attachments: jsonb('attachments').$type<ChatAttachment[]>(),
   createdAt: timestamp('created_at').defaultNow(),
 });
 
