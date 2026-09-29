@@ -19,7 +19,18 @@ const vector = customType<{
   },
 });
 
-// KB article chunks with embeddings
+// Staff-uploaded documents (runbooks, past-ticket exports, etc.)
+export const documents = pgTable('documents', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  filename: text('filename').notNull(),
+  fileType: text('file_type').notNull(),
+  status: text('status').notNull().default('processing'), // processing | ready | failed
+  chunkCount: integer('chunk_count').notNull().default(0),
+  errorMessage: text('error_message'),
+  uploadedAt: timestamp('uploaded_at').defaultNow(),
+});
+
+// KB article, OIT website, and uploaded-document chunks with embeddings
 export const kbChunks = pgTable('kb_chunks', {
   id: serial('id').primaryKey(),
   url: text('url').notNull(),
@@ -28,6 +39,8 @@ export const kbChunks = pgTable('kb_chunks', {
   content: text('content').notNull(),
   chunkIndex: integer('chunk_index').notNull(),
   embedding: vector('embedding'),
+  source: text('source').notNull().default('kb'), // kb | oit | upload
+  documentId: uuid('document_id').references(() => documents.id, { onDelete: 'cascade' }),
   createdAt: timestamp('created_at').defaultNow(),
 });
 
@@ -55,4 +68,24 @@ export const chatMessages = pgTable('chat_messages', {
   role: text('role').notNull(),
   content: text('content').notNull(),
   createdAt: timestamp('created_at').defaultNow(),
+});
+
+// Technician feedback on an assistant answer (one row per answer)
+export const messageFeedback = pgTable('message_feedback', {
+  id: serial('id').primaryKey(),
+  messageId: integer('message_id')
+    .notNull()
+    .unique()
+    .references(() => chatMessages.id, { onDelete: 'cascade' }),
+  conversationId: uuid('conversation_id')
+    .notNull()
+    .references(() => conversations.id, { onDelete: 'cascade' }),
+  sessionId: uuid('session_id').notNull(),
+  rating: text('rating').notNull(), // helpful | partial | not_helpful
+  reason: text('reason'),
+  comment: text('comment'),
+  question: text('question'),
+  answer: text('answer').notNull(),
+  createdAt: timestamp('created_at').defaultNow(),
+  updatedAt: timestamp('updated_at').defaultNow(),
 });

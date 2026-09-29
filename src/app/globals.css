@@ -2,8 +2,29 @@
 @plugin "@tailwindcss/typography";
 
 :root {
-  --background: #f4f5f7;
-  --foreground: #171717;
+  color-scheme: dark;
+
+  /* Dark theme surfaces, from the page backdrop up to raised controls. */
+  /* Soft slate rather than near-black, so the dark theme feels calm instead of stark. */
+  --canvas: #1e2128;
+  --sidebar: #181b21;
+  --surface: #262a32;
+  --elevated: #2f343d;
+  --line: #333843;
+  --line-strong: #444a56;
+
+  /* Text, from primary down to hints. */
+  --fg: #eceef2;
+  --muted: #b3b9c4;
+  --faint: #8b929e;
+
+  /* BYUH crimson, warmed toward rose for dark: a fill for buttons and a soft tone for text/icons. */
+  --accent: #c73a55;
+  --accent-hover: #b02f49;
+  --accent-text: #f596a8;
+
+  --background: var(--canvas);
+  --foreground: var(--fg);
 
   --color-crimson: #ba0c2f;
   --color-burgundy: #9e1b34;
@@ -14,6 +35,18 @@
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --color-canvas: var(--canvas);
+  --color-sidebar: var(--sidebar);
+  --color-surface: var(--surface);
+  --color-elevated: var(--elevated);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-text: var(--accent-text);
   --color-crimson: var(--color-crimson);
   --color-burgundy: var(--color-burgundy);
   --color-gold: var(--color-gold);
@@ -22,7 +55,52 @@
   --font-mono: var(--font-geist-mono);
 }
 
+@theme {
+  --animate-fade-in-up: fade-in-up 0.25s ease-out both;
+  --animate-pop-in: pop-in 0.18s ease-out both;
+
+  @keyframes fade-in-up {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes pop-in {
+    from {
+      opacity: 0;
+      transform: scale(0.97);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-in-up,
+  .animate-pop-in {
+    animation: none;
+  }
+}
+
 body {
   background: var(--background);
   color: var(--foreground);
+}
+
+/* Slim, low-contrast scrollbars so they don't glare against the dark surfaces. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+::selection {
+  background: rgb(199 58 85 / 0.5);
+  color: #fff;
 }

@@ -1,11 +1,36 @@
 'use client';
 
-import { useState, useEffect, useRef, FormEvent } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo, FormEvent, ChangeEvent, DragEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { useChat } from '@ai-sdk/react';
-import { DefaultChatTransport } from 'ai';
+import { DefaultChatTransport, type UIMessage } from 'ai';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Plus, Trash2, Menu, X, Send, Loader2, LifeBuoy } from 'lucide-react';
+import {
+  Plus,
+  Trash2,
+  Menu,
+  X,
+  Send,
+  Loader2,
+  LifeBuoy,
+  FileUp,
+  ThumbsUp,
+  ThumbsDown,
+  Meh,
+  Search,
+  Copy,
+  Check,
+  User,
+  ShieldCheck,
+  Briefcase,
+  Wifi,
+  KeyRound,
+  FileText,
+  CircleAlert,
+  RotateCcw,
+  CloudUpload,
+} from 'lucide-react';
+import { FEEDBACK_REASONS, MAX_FEEDBACK_COMMENT_LENGTH, type FeedbackRating } from '@/lib/feedback';
 
 interface Conversation {
   id: string;
@@ -13,17 +38,69 @@ interface Conversation {
   createdAt: string;
 }
 
+interface DocumentRow {
+  id: string;
+  filename: string;
+  fileType: string;
+  status: 'processing' | 'ready' | 'failed';
+  chunkCount: number;
+  errorMessage: string | null;
+  uploadedAt: string;
+}
+
 const SUGGESTIONS = [
-  'SMS MFA codes are intermittently failing',
-  "Student can't update office location in Workday",
-  'ASUS Housing router setup issue',
-  'NetID / password recovery steps',
+  { text: 'SMS MFA codes are intermittently failing', topic: 'MFA', icon: ShieldCheck },
+  { text: "Student can't update office location in Workday", topic: 'Workday', icon: Briefcase },
+  { text: 'ASUS Housing router setup issue', topic: 'Housing network', icon: Wifi },
+  { text: 'NetID / password recovery steps', topic: 'Accounts', icon: KeyRound },
 ];
+
+function greeting(): string {
+  const hour = new Date().getHours();
+  if (hour < 12) return 'Good morning';
+  if (hour < 17) return 'Good afternoon';
+  return 'Good evening';
+}
+
+// The last few turns are enough context to guess what the technician will answer next.
+const SUGGESTION_CONTEXT_MESSAGES = 4;
+
+function messageText(message: UIMessage): string {
+  return message.parts
+    .filter((part): part is { type: 'text'; text: string } => part.type === 'text')
+    .map((part) => part.text)
+    .join('\n')
+    .trim();
+}
+
+const DATE_BUCKET_ORDER = ['Today', 'Yesterday', 'Previous 7 days', 'Previous 30 days', 'Older'] as const;
+
+function dateBucket(createdAt: string): (typeof DATE_BUCKET_ORDER)[number] {
+  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const daysAgo = Math.round((startOfDay(new Date()) - startOfDay(new Date(createdAt))) / 86_400_000);
+
+  if (daysAgo <= 0) return 'Today';
+  if (daysAgo === 1) return 'Yesterday';
+  if (daysAgo <= 7) return 'Previous 7 days';
+  if (daysAgo <= 30) return 'Previous 30 days';
+  return 'Older';
+}
+
+// A conversation still on its default title hasn't had a first message yet —
+// showing that in the header would read as a stuck app, not an empty ticket.
+const UNTITLED_CONVERSATION = 'New conversation';
 
 export default function Home() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [conversationsLoaded, setConversationsLoaded] = useState(false);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [docsModalOpen, setDocsModalOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  // Delete is two clicks: the first arms it, the second (within a few seconds) confirms.
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const confirmDeleteTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     (async () => {
@@ -37,7 +114,25 @@ export default function Home() {
         setConversations([created]);
         setActiveId(created.id);
       }
+      setConversationsLoaded(true);
     })();
+  }, []);
+
+  // Cmd/Ctrl+K jumps straight to the conversation search, opening the sidebar on mobile if needed.
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== 'k') return;
+      e.preventDefault();
+      setSidebarOpen(true);
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  useEffect(() => () => {
+    if (confirmDeleteTimer.current) clearTimeout(confirmDeleteTimer.current);
   }, []);
 
   async function refreshConversations() {
@@ -50,10 +145,16 @@ export default function Home() {
     setConversations((prev) => [created, ...prev]);
     setActiveId(created.id);
     setSidebarOpen(false);
+    setSearchQuery('');
   }
 
-  async function deleteConversation(id: string, e: React.MouseEvent) {
-    e.stopPropagation();
+  function selectConversation(id: string) {
+    setConfirmDeleteId(null);
+    setActiveId(id);
+    setSidebarOpen(false);
+  }
+
+  async function deleteConversation(id: string) {
     await fetch(`/api/conversations/${id}`, { method: 'DELETE' });
     const remaining = conversations.filter((c) => c.id !== id);
     setConversations(remaining);
@@ -66,72 +167,578 @@ export default function Home() {
     }
   }
 
+  function handleDeleteClick(id: string, e: React.MouseEvent) {
+    e.stopPropagation();
+    if (confirmDeleteTimer.current) clearTimeout(confirmDeleteTimer.current);
+
+    if (confirmDeleteId === id) {
+      setConfirmDeleteId(null);
+      deleteConversation(id);
+      return;
+    }
+    setConfirmDeleteId(id);
+    confirmDeleteTimer.current = setTimeout(() => setConfirmDeleteId(null), 4000);
+  }
+
+  const groupedConversations = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    const filtered = q ? conversations.filter((c) => c.title.toLowerCase().includes(q)) : conversations;
+
+    const buckets = new Map<string, Conversation[]>();
+    for (const c of filtered) {
+      const bucket = dateBucket(c.createdAt);
+      if (!buckets.has(bucket)) buckets.set(bucket, []);
+      buckets.get(bucket)!.push(c);
+    }
+    return DATE_BUCKET_ORDER.map((label) => ({ label, items: buckets.get(label) ?? [] })).filter(
+      (g) => g.items.length > 0
+    );
+  }, [conversations, searchQuery]);
+
+  const activeConversation = conversations.find((c) => c.id === activeId);
+  const headerTitle =
+    activeConversation && activeConversation.title !== UNTITLED_CONVERSATION
+      ? activeConversation.title
+      : 'OIT Help Desk Assistant';
+
   return (
-    <div className="flex h-screen overflow-hidden bg-background text-foreground">
+    <div className="flex h-screen overflow-hidden bg-canvas text-fg">
       <aside
-        className={`fixed md:static inset-y-0 left-0 z-30 w-72 bg-burgundy text-white flex flex-col transition-transform duration-200 ${
+        className={`fixed md:static inset-y-0 left-0 z-30 w-72 bg-sidebar border-r border-line text-fg flex flex-col transition-transform duration-200 ${
           sidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
         }`}
       >
-        <div className="p-4 flex items-center justify-between border-b border-white/10">
-          <span className="font-semibold text-sm tracking-wide">CONVERSATIONS</span>
-          <button className="md:hidden" onClick={() => setSidebarOpen(false)} aria-label="Close sidebar">
+        <div className="p-4 flex items-center gap-3">
+          <div className="flex items-center justify-center w-9 h-9 rounded-xl bg-accent text-white shrink-0">
+            <LifeBuoy size={18} />
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className="font-semibold text-sm leading-tight">OIT Help Desk</p>
+            <p className="text-xs text-faint leading-tight">Your ticket sidekick</p>
+          </div>
+          <button
+            className="md:hidden p-1 rounded-md text-muted hover:text-fg hover:bg-elevated"
+            onClick={() => setSidebarOpen(false)}
+            aria-label="Close sidebar"
+          >
             <X size={18} />
           </button>
         </div>
 
-        <button
-          onClick={createConversation}
-          className="m-3 flex items-center gap-2 rounded-lg bg-white/10 hover:bg-white/20 px-3 py-2 text-sm transition-colors"
-        >
-          <Plus size={16} /> New chat
-        </button>
+        <div className="px-3 pb-3 border-b border-line space-y-2">
+          <button
+            onClick={createConversation}
+            className="w-full flex items-center gap-2 rounded-lg border border-line-strong bg-elevated text-fg font-medium hover:border-accent-text/50 hover:bg-[#383e48] px-3 py-2.5 text-sm transition-colors"
+          >
+            <Plus size={16} /> New chat
+          </button>
 
-        <div className="flex-1 overflow-y-auto px-2 space-y-1">
-          {conversations.map((c) => (
-            <button
-              key={c.id}
-              onClick={() => {
-                setActiveId(c.id);
-                setSidebarOpen(false);
-              }}
-              className={`w-full text-left px-3 py-2 rounded-lg text-sm flex items-center justify-between group transition-colors ${
-                c.id === activeId ? 'bg-white/20' : 'hover:bg-white/10'
-              }`}
-            >
-              <span className="truncate">{c.title}</span>
-              <Trash2
-                size={14}
-                className="opacity-0 group-hover:opacity-70 hover:opacity-100 shrink-0 ml-2"
-                onClick={(e) => deleteConversation(c.id, e)}
-              />
-            </button>
-          ))}
+          <button
+            onClick={() => setDocsModalOpen(true)}
+            className="w-full flex items-center gap-2 rounded-lg text-muted hover:text-fg hover:bg-elevated px-3 py-2 text-sm transition-colors"
+          >
+            <FileUp size={14} /> Manage internal docs
+          </button>
+
+          <div className="relative">
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-faint pointer-events-none" />
+            <input
+              ref={searchInputRef}
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search conversations…"
+              title="Search conversations (Ctrl+K)"
+              className="w-full bg-canvas border border-line placeholder:text-faint text-fg text-sm rounded-lg pl-8 pr-12 py-2 focus:outline-none focus:border-line-strong focus:ring-1 focus:ring-accent-text/30 transition-colors"
+            />
+            {searchQuery ? (
+              <button
+                onClick={() => setSearchQuery('')}
+                aria-label="Clear search"
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-faint hover:text-fg"
+              >
+                <X size={13} />
+              </button>
+            ) : (
+              <kbd className="hidden md:block absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none rounded border border-line-strong px-1.5 text-[10px] font-sans text-faint">
+                Ctrl K
+              </kbd>
+            )}
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-2 pt-3">
+          {!conversationsLoaded ? (
+            <div className="px-3 py-2 space-y-2 animate-pulse">
+              {[0, 1, 2].map((i) => (
+                <div key={i} className="h-9 rounded-lg bg-elevated" />
+              ))}
+            </div>
+          ) : groupedConversations.length === 0 ? (
+            <p className="px-3 py-6 text-center text-xs text-faint">
+              {searchQuery ? `Nothing matches “${searchQuery}”. Try another word?` : 'No conversations yet. Start one above!'}
+            </p>
+          ) : (
+            groupedConversations.map((group) => (
+              <div key={group.label} className="mb-3 last:mb-0">
+                <p className="px-3 pb-1.5 text-[11px] font-medium tracking-wide text-faint uppercase">
+                  {group.label}
+                </p>
+                <div className="space-y-1">
+                  {group.items.map((c) => (
+                    <div
+                      key={c.id}
+                      className={`relative flex items-center rounded-lg text-sm group transition-colors ${
+                        c.id === activeId
+                          ? 'bg-elevated text-fg before:absolute before:left-0 before:top-2 before:bottom-2 before:w-0.5 before:rounded-full before:bg-accent-text'
+                          : 'text-muted hover:bg-elevated/60 hover:text-fg'
+                      }`}
+                    >
+                      <button
+                        onClick={() => selectConversation(c.id)}
+                        title={c.title}
+                        className="flex-1 min-w-0 text-left px-3 py-2.5 truncate"
+                      >
+                        {c.title}
+                      </button>
+                      {confirmDeleteId === c.id ? (
+                        <button
+                          type="button"
+                          onClick={(e) => handleDeleteClick(c.id, e)}
+                          className="shrink-0 mr-2 rounded-full bg-red-500 hover:bg-red-600 text-white text-[10px] font-medium px-2 py-1 transition-colors"
+                        >
+                          Confirm delete
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={(e) => handleDeleteClick(c.id, e)}
+                          aria-label={`Delete "${c.title}"`}
+                          title="Delete conversation"
+                          className="shrink-0 mr-1.5 p-1.5 rounded text-faint opacity-0 group-hover:opacity-100 hover:text-red-400 hover:bg-red-500/10 transition-all"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))
+          )}
         </div>
       </aside>
 
       {sidebarOpen && (
-        <div className="fixed inset-0 bg-black/40 z-20 md:hidden" onClick={() => setSidebarOpen(false)} />
+        <div className="fixed inset-0 bg-black/60 z-20 md:hidden" onClick={() => setSidebarOpen(false)} />
       )}
 
       <div className="flex-1 flex flex-col min-w-0">
-        <header className="bg-crimson text-white px-4 py-3 flex items-center gap-3 shadow-sm shrink-0">
-          <button className="md:hidden" onClick={() => setSidebarOpen(true)} aria-label="Open sidebar">
+        <header className="bg-canvas/80 backdrop-blur border-b border-line px-4 py-3 flex items-center gap-3 shrink-0">
+          <button
+            className="md:hidden p-1 -ml-1 rounded-md text-muted hover:text-fg hover:bg-elevated"
+            onClick={() => setSidebarOpen(true)}
+            aria-label="Open sidebar"
+          >
             <Menu size={20} />
           </button>
-          <LifeBuoy size={20} />
-          <div>
-            <h1 className="font-semibold text-sm leading-tight">OIT Help Desk Assistant</h1>
-            <p className="text-xs text-white/80 leading-tight">KB-grounded troubleshooting for IT staff</p>
+          <div className="flex-1 min-w-0">
+            <h1 className="font-semibold text-sm leading-tight truncate text-fg">{headerTitle}</h1>
+            <p className="text-xs text-faint leading-tight flex items-center gap-1.5 mt-0.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" aria-hidden />
+              Answers grounded in the OIT knowledge base
+            </p>
           </div>
+          <button
+            onClick={createConversation}
+            className="hidden sm:flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-xs font-medium text-muted hover:border-line-strong hover:text-fg hover:bg-elevated transition-colors"
+          >
+            <Plus size={14} /> New chat
+          </button>
         </header>
 
         {activeId ? (
           <ChatPanel key={activeId} conversationId={activeId} onExchangeComplete={refreshConversations} />
         ) : (
-          <div className="flex-1 flex items-center justify-center text-gray-400 text-sm">Loading…</div>
+          <div className="flex-1 flex flex-col items-center justify-center gap-2 text-faint text-sm">
+            <Loader2 size={20} className="animate-spin text-accent-text" />
+            Getting things ready…
+          </div>
         )}
       </div>
+
+      {docsModalOpen && <DocumentsModal onClose={() => setDocsModalOpen(false)} />}
+    </div>
+  );
+}
+
+function DocumentsModal({ onClose }: { onClose: () => void }) {
+  const [docs, setDocs] = useState<DocumentRow[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  async function refresh() {
+    const res = await fetch('/api/documents');
+    setDocs(await res.json());
+  }
+
+  useEffect(() => {
+    (async () => {
+      const res = await fetch('/api/documents');
+      setDocs(await res.json());
+    })();
+  }, []);
+
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') onClose();
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
+
+  function handleFileChange(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (file) upload(file);
+  }
+
+  function handleDrop(e: DragEvent<HTMLLabelElement>) {
+    e.preventDefault();
+    setDragging(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file && !uploading) upload(file);
+  }
+
+  async function upload(file: File) {
+    setUploading(true);
+    setError(null);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await fetch('/api/documents', { method: 'POST', body: formData });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Upload failed.');
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Upload failed.');
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }
+
+  async function handleDelete(id: string) {
+    setDocs((prev) => prev.filter((d) => d.id !== id));
+    await fetch(`/api/documents/${id}`, { method: 'DELETE' });
+  }
+
+  return (
+    <div className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={onClose}>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="docs-modal-title"
+        className="bg-surface border border-line rounded-2xl w-full max-w-lg max-h-[80vh] flex flex-col shadow-2xl shadow-black/50 animate-pop-in"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="p-5 border-b border-line flex items-start justify-between gap-3 shrink-0">
+          <div>
+            <h2 id="docs-modal-title" className="font-semibold text-fg">Internal runbooks & docs</h2>
+            <p className="text-xs text-muted mt-0.5">
+              Anything you add here helps the assistant give better, more specific answers.
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            className="p-1 rounded-md text-faint hover:text-fg hover:bg-elevated"
+          >
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="p-5 border-b border-line shrink-0">
+          <label
+            onDragOver={(e) => {
+              e.preventDefault();
+              if (!uploading) setDragging(true);
+            }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={handleDrop}
+            className={`flex flex-col items-center justify-center gap-1.5 border-2 border-dashed rounded-xl py-6 text-sm transition-colors ${
+              dragging ? 'border-accent-text bg-accent/10 text-accent-text' : 'border-line-strong text-muted'
+            } ${uploading ? 'opacity-60' : 'cursor-pointer hover:border-accent-text/70 hover:text-fg hover:bg-elevated/50'}`}
+          >
+            {uploading ? <Loader2 size={22} className="animate-spin" /> : <CloudUpload size={22} />}
+            <span className="font-medium">
+              {uploading ? 'Uploading & indexing…' : dragging ? 'Drop it here' : 'Drag a file here, or click to browse'}
+            </span>
+            {!uploading && <span className="text-xs text-faint">PDF, Word, Excel, or CSV</span>}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".pdf,.docx,.xlsx,.xls,.csv"
+              className="hidden"
+              onChange={handleFileChange}
+              disabled={uploading}
+            />
+          </label>
+          {error && <p className="text-xs text-red-400 mt-2">{error}</p>}
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-2">
+          {docs.length === 0 ? (
+            <div className="text-center py-8 px-4">
+              <FileText size={28} className="mx-auto text-line-strong" />
+              <p className="text-sm text-muted mt-2">No documents yet</p>
+              <p className="text-xs text-faint mt-1">Upload your first runbook to get started.</p>
+            </div>
+          ) : (
+            docs.map((d) => (
+              <div
+                key={d.id}
+                className="group flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-elevated text-sm"
+              >
+                <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-elevated text-muted shrink-0">
+                  <FileText size={16} />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate font-medium text-fg" title={d.filename}>
+                    {d.filename}
+                  </p>
+                  {d.status === 'failed' ? (
+                    <p className="text-xs text-red-400 truncate" title={d.errorMessage ?? undefined}>
+                      {d.errorMessage || 'Something went wrong while indexing.'}
+                    </p>
+                  ) : (
+                    d.status === 'ready' && (
+                      <p className="text-xs text-faint">
+                        {d.chunkCount} section{d.chunkCount === 1 ? '' : 's'} indexed
+                      </p>
+                    )
+                  )}
+                </div>
+                <DocStatusBadge status={d.status} />
+                <button
+                  type="button"
+                  onClick={() => handleDelete(d.id)}
+                  aria-label={`Delete ${d.filename}`}
+                  title="Delete document"
+                  className="p-1.5 rounded-md text-faint opacity-60 group-hover:opacity-100 hover:text-red-400 hover:bg-red-500/10 transition-colors shrink-0"
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const DOC_STATUS_STYLES: Record<DocumentRow['status'], { label: string; className: string }> = {
+  processing: { label: 'Processing', className: 'bg-amber-500/10 text-amber-300 ring-amber-500/25' },
+  ready: { label: 'Ready', className: 'bg-emerald-500/10 text-emerald-300 ring-emerald-500/25' },
+  failed: { label: 'Failed', className: 'bg-red-500/10 text-red-300 ring-red-500/25' },
+};
+
+function DocStatusBadge({ status }: { status: DocumentRow['status'] }) {
+  const { label, className } = DOC_STATUS_STYLES[status];
+  return (
+    <span className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ring-1 ring-inset ${className}`}>
+      {label}
+    </span>
+  );
+}
+
+function AssistantAvatar() {
+  return (
+    <div className="flex items-center justify-center w-8 h-8 rounded-full bg-accent/15 text-accent-text ring-1 ring-accent/30 shrink-0">
+      <LifeBuoy size={16} />
+    </div>
+  );
+}
+
+function UserAvatar() {
+  return (
+    <div className="flex items-center justify-center w-8 h-8 rounded-full bg-elevated text-muted ring-1 ring-line-strong shrink-0">
+      <User size={16} />
+    </div>
+  );
+}
+
+// Answers usually end up pasted into ticket notes, so copying should be one click.
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(false), 1500);
+    return () => clearTimeout(timer);
+  }, [copied]);
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+    } catch {
+      // Clipboard can be blocked (e.g. insecure context); the text is still selectable.
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={copy}
+      className="flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-faint hover:text-fg hover:bg-elevated transition-colors"
+    >
+      {copied ? <Check size={13} className="text-emerald-400" /> : <Copy size={13} />}
+      {copied ? 'Copied' : 'Copy'}
+    </button>
+  );
+}
+
+const RATING_OPTIONS: { rating: FeedbackRating; label: string; icon: typeof ThumbsUp }[] = [
+  { rating: 'helpful', label: 'Yes', icon: ThumbsUp },
+  { rating: 'partial', label: 'Partly', icon: Meh },
+  { rating: 'not_helpful', label: 'No', icon: ThumbsDown },
+];
+
+function FeedbackPopup({
+  conversationId,
+  onClose,
+  raised,
+}: {
+  conversationId: string;
+  onClose: () => void;
+  raised: boolean;
+}) {
+  const [rating, setRating] = useState<FeedbackRating | null>(null);
+  const [reason, setReason] = useState<string | null>(null);
+  const [comment, setComment] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!submitted) return;
+    const timer = setTimeout(onClose, 1500);
+    return () => clearTimeout(timer);
+  }, [submitted, onClose]);
+
+  async function submit(finalRating: FeedbackRating) {
+    setSubmitting(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          conversationId,
+          rating: finalRating,
+          reason: finalRating === 'helpful' ? null : reason,
+          comment: comment.trim() || null,
+        }),
+      });
+      if (!res.ok) throw new Error('Could not save feedback.');
+      setSubmitted(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not save feedback.');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  function pickRating(r: FeedbackRating) {
+    setRating(r);
+    // A positive rating needs no follow-up, so it is sent right away.
+    if (r === 'helpful') submit(r);
+  }
+
+  return (
+    <div
+      role="dialog"
+      aria-label="Answer feedback"
+      className={`fixed right-4 left-4 sm:left-auto sm:w-80 z-10 bg-surface border border-line-strong rounded-2xl shadow-2xl shadow-black/50 p-4 transition-[bottom] animate-pop-in ${
+        raised ? 'bottom-48' : 'bottom-28'
+      }`}
+    >
+      <button onClick={onClose} aria-label="Dismiss feedback" className="absolute top-3 right-3 text-faint hover:text-fg">
+        <X size={16} />
+      </button>
+
+      {submitted ? (
+        <p className="flex items-center gap-2 text-sm text-fg py-2">
+          <Check size={16} className="text-emerald-400 shrink-0" />
+          Thanks! Your feedback helps us improve the assistant.
+        </p>
+      ) : (
+        <>
+          <p className="text-sm font-medium text-fg pr-6">Did this answer help with the ticket?</p>
+
+          <div className="flex gap-2 mt-3">
+            {RATING_OPTIONS.map(({ rating: r, label, icon: Icon }) => (
+              <button
+                key={r}
+                onClick={() => pickRating(r)}
+                disabled={submitting}
+                className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg border px-2 py-1.5 text-sm transition-colors disabled:opacity-50 ${
+                  rating === r
+                    ? 'border-accent bg-accent text-white'
+                    : 'border-line-strong text-muted hover:border-accent-text/60 hover:text-fg'
+                }`}
+              >
+                <Icon size={14} /> {label}
+              </button>
+            ))}
+          </div>
+
+          {(rating === 'partial' || rating === 'not_helpful') && (
+            <div className="mt-3 space-y-3">
+              <div className="flex flex-wrap gap-1.5">
+                {FEEDBACK_REASONS.map((r) => (
+                  <button
+                    key={r}
+                    onClick={() => setReason(reason === r ? null : r)}
+                    className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${
+                      reason === r
+                        ? 'border-accent-text/60 bg-accent/15 text-accent-text'
+                        : 'border-line-strong text-muted hover:border-accent-text/60 hover:text-fg'
+                    }`}
+                  >
+                    {r}
+                  </button>
+                ))}
+              </div>
+              <textarea
+                value={comment}
+                onChange={(e) => setComment(e.target.value)}
+                maxLength={MAX_FEEDBACK_COMMENT_LENGTH}
+                rows={2}
+                placeholder="What was wrong or missing? (optional)"
+                className="w-full bg-canvas border border-line-strong rounded-lg px-3 py-2 text-sm text-fg placeholder:text-faint focus:outline-none focus:border-accent-text/60 resize-none"
+              />
+              <button
+                onClick={() => submit(rating)}
+                disabled={submitting}
+                className="w-full bg-accent text-white rounded-lg py-2 text-sm font-medium hover:bg-accent-hover transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+              >
+                {submitting && <Loader2 size={14} className="animate-spin" />} Send feedback
+              </button>
+            </div>
+          )}
+
+          {error && <p className="text-xs text-red-400 mt-2">{error}</p>}
+
+          <p className="text-[11px] leading-snug text-faint mt-3">
+            Your rating, comment, and this question and answer are saved to the help desk assistant&apos;s
+            feedback log so OIT can improve it. It is not linked to your name, but it may include ticket
+            details you typed.
+          </p>
+        </>
+      )}
     </div>
   );
 }
@@ -145,11 +752,23 @@ function ChatPanel({
 }) {
   const [input, setInput] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const prevStatusRef = useRef<string>('ready');
+  const [feedbackKey, setFeedbackKey] = useState<string | null>(null);
+  // Tied to the message the replies answer, so replies for an older turn never linger.
+  const [suggestionState, setSuggestionState] = useState<{ forMessageId: string; items: string[] }>({
+    forMessageId: '',
+    items: [],
+  });
 
-  const { messages, sendMessage, status, setMessages } = useChat({
+  const { messages, sendMessage, status, setMessages, error, regenerate, clearError } = useChat({
     id: conversationId,
     transport: new DefaultChatTransport({ api: '/api/chat' }),
+    onFinish: ({ message, isAbort, isDisconnect, isError }) => {
+      if (message.role === 'assistant' && !isAbort && !isDisconnect && !isError) {
+        setFeedbackKey(message.id);
+      }
+    },
   });
 
   useEffect(() => {
@@ -163,7 +782,15 @@ function ChatPanel({
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, error]);
+
+  // Grow the input with its content (up to a cap) so longer ticket descriptions stay readable.
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  }, [input]);
 
   useEffect(() => {
     if (prevStatusRef.current !== 'ready' && status === 'ready') {
@@ -174,66 +801,219 @@ function ChatPanel({
 
   const isBusy = status === 'streaming' || status === 'submitted';
 
+  const lastMessage = messages[messages.length - 1];
+  // Quick replies only answer a finished assistant turn.
+  const canSuggest = !isBusy && lastMessage?.role === 'assistant';
+  const suggestionsReady = canSuggest && suggestionState.forMessageId === lastMessage.id;
+  const suggestions = useMemo(
+    () => (suggestionsReady ? suggestionState.items : []),
+    [suggestionsReady, suggestionState.items]
+  );
+  const suggestionsLoading = canSuggest && !suggestionsReady;
+  const showTypingIndicator =
+    status === 'submitted' || (status === 'streaming' && (lastMessage?.role !== 'assistant' || !messageText(lastMessage)));
+
+  // Offer clickable replies to whatever the assistant just asked, so the technician
+  // can answer without typing while the caller is waiting.
+  useEffect(() => {
+    if (!canSuggest) return;
+
+    const forMessageId = lastMessage.id;
+    const context = messages
+      .slice(-SUGGESTION_CONTEXT_MESSAGES)
+      .map((m) => ({ role: m.role, text: messageText(m) }));
+    const controller = new AbortController();
+
+    (async () => {
+      let items: string[] = [];
+      try {
+        const res = await fetch('/api/suggestions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({ messages: context }),
+        });
+        if (res.ok) {
+          const data: { suggestions?: unknown } = await res.json();
+          if (Array.isArray(data.suggestions)) items = data.suggestions.filter((s) => typeof s === 'string');
+        }
+      } catch {
+        // Quick replies are optional — the technician can still type.
+      }
+      // Recording the id even on failure stops the spinner instead of retrying forever.
+      if (!controller.signal.aborted) setSuggestionState({ forMessageId, items });
+    })();
+
+    return () => controller.abort();
+  }, [messages, canSuggest, lastMessage?.id]);
+
+  const send = useCallback(
+    (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed || isBusy) return;
+      setFeedbackKey(null);
+      if (error) clearError();
+      sendMessage({ text: trimmed });
+      setInput('');
+      textareaRef.current?.focus();
+    },
+    [isBusy, sendMessage, error, clearError]
+  );
+
+  // Number-key shortcuts for the quick-reply chips, so a technician mid-call never
+  // has to reach for the mouse. Digits are ignored while the technician is actually
+  // typing, so they don't hijack normal ticket-note entry.
+  useEffect(() => {
+    if (suggestions.length === 0 || isBusy) return;
+
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+      if (e.key === 'Escape') {
+        setInput('');
+        return;
+      }
+
+      const target = e.target as HTMLElement | null;
+      const isEditable =
+        target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable;
+      if (isEditable) return;
+
+      const index = Number(e.key) - 1;
+      if (Number.isInteger(index) && index >= 0 && index < suggestions.length) {
+        e.preventDefault();
+        send(suggestions[index]);
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [suggestions, isBusy, send]);
+
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
-    if (!input.trim() || isBusy) return;
-    sendMessage({ text: input });
-    setInput('');
+    send(input);
+  }
+
+  // Enter sends, Shift+Enter adds a line break — the usual chat convention.
+  function handleInputKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+      e.preventDefault();
+      send(input);
+    }
   }
 
   return (
     <>
       <main className="flex-1 overflow-y-auto px-4 py-6">
         {messages.length === 0 ? (
-          <div className="max-w-xl mx-auto text-center mt-16 space-y-6">
-            <h2 className="text-xl font-semibold text-navy">How can I help with this ticket?</h2>
-            <p className="text-sm text-gray-500">
-              Ask about any OIT knowledge base topic — MFA, RingCentral, Housing routers, Workday, student labor
-              issues, and more.
+          <div className="max-w-2xl mx-auto text-center mt-10 sm:mt-20 animate-fade-in-up">
+            <div className="mx-auto flex items-center justify-center w-11 h-11 rounded-xl bg-accent/15 text-accent-text ring-1 ring-accent/30">
+              <LifeBuoy size={22} />
+            </div>
+            <h2 className="mt-5 text-2xl sm:text-3xl font-semibold tracking-tight text-fg">
+              {greeting()}. <span className="text-muted">What&apos;s the ticket?</span>
+            </h2>
+            <p className="mt-3 text-sm text-muted leading-relaxed max-w-lg mx-auto">
+              Describe what the caller is seeing and I&apos;ll walk you through it using the OIT knowledge base: MFA,
+              RingCentral, Housing routers, Workday, student labor, and more.
             </p>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-left">
-              {SUGGESTIONS.map((s) => (
+            <p className="mt-10 mb-3 text-left text-xs font-medium uppercase tracking-wider text-faint">Common issues</p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-left">
+              {SUGGESTIONS.map(({ text, topic, icon: Icon }) => (
                 <button
-                  key={s}
-                  onClick={() => setInput(s)}
-                  className="border border-gray-200 rounded-lg px-3 py-2 text-sm bg-white hover:border-crimson hover:text-crimson transition-colors"
+                  key={text}
+                  onClick={() => send(text)}
+                  className="group flex items-start gap-3 text-left border border-line rounded-xl px-4 py-3.5 bg-surface hover:bg-elevated hover:border-line-strong transition-colors"
                 >
-                  {s}
+                  <span className="flex items-center justify-center w-8 h-8 rounded-lg bg-elevated text-muted shrink-0 group-hover:bg-accent/15 group-hover:text-accent-text transition-colors">
+                    <Icon size={16} />
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block text-[11px] font-medium uppercase tracking-wider text-faint">
+                      {topic}
+                    </span>
+                    <span className="block mt-0.5 text-sm leading-snug text-fg">
+                      {text}
+                    </span>
+                  </span>
                 </button>
               ))}
             </div>
           </div>
         ) : (
-          <div className="max-w-3xl mx-auto space-y-4">
-            {messages.map((m) => (
-              <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+          <div className="max-w-3xl mx-auto space-y-5">
+            {messages.map((m) => {
+              const isUser = m.role === 'user';
+              const text = messageText(m);
+              const isStreamingThis = isBusy && m.id === lastMessage?.id && !isUser;
+              // An assistant turn with no text yet is covered by the typing indicator below.
+              if (!isUser && !text) return null;
+              return (
                 <div
-                  className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm ${
-                    m.role === 'user'
-                      ? 'bg-crimson text-white'
-                      : 'bg-white border border-gray-200 shadow-sm prose prose-sm max-w-none'
-                  }`}
+                  key={m.id}
+                  className={`flex items-start gap-3 animate-fade-in-up ${isUser ? 'flex-row-reverse' : ''}`}
                 >
-                  {m.parts.map((part, i) =>
-                    part.type === 'text' ? (
-                      m.role === 'assistant' ? (
-                        <ReactMarkdown key={i} remarkPlugins={[remarkGfm]}>
-                          {part.text}
-                        </ReactMarkdown>
-                      ) : (
-                        <span key={i}>{part.text}</span>
-                      )
-                    ) : null
-                  )}
+                  {isUser ? <UserAvatar /> : <AssistantAvatar />}
+                  <div className={`flex flex-col min-w-0 max-w-[85%] ${isUser ? 'items-end' : 'items-start'}`}>
+                    <div
+                      className={`rounded-2xl px-4 py-2.5 text-sm ${
+                        isUser
+                          ? 'bg-elevated text-fg border border-line-strong rounded-tr-md whitespace-pre-wrap'
+                          : 'bg-surface border border-line rounded-tl-md prose prose-sm prose-invert max-w-none prose-p:text-fg prose-li:text-fg prose-strong:text-white prose-a:text-accent-text prose-a:no-underline hover:prose-a:underline prose-code:text-accent-text prose-code:before:content-none prose-code:after:content-none prose-pre:bg-canvas prose-pre:border prose-pre:border-line prose-hr:border-line prose-th:text-fg prose-td:border-line'
+                      }`}
+                    >
+                      {m.parts.map((part, i) =>
+                        part.type === 'text' ? (
+                          isUser ? (
+                            <span key={i}>{part.text}</span>
+                          ) : (
+                            <ReactMarkdown key={i} remarkPlugins={[remarkGfm]}>
+                              {part.text}
+                            </ReactMarkdown>
+                          )
+                        ) : null
+                      )}
+                    </div>
+                    {!isUser && text && !isStreamingThis && (
+                      <div className="mt-1">
+                        <CopyButton text={text} />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+            {showTypingIndicator && (
+              <div className="flex items-start gap-3 animate-fade-in-up">
+                <AssistantAvatar />
+                <div className="bg-surface border border-line rounded-2xl rounded-tl-md px-4 py-3 flex items-center gap-3">
+                  <span className="flex gap-1">
+                    <span className="w-2 h-2 bg-accent-text/70 rounded-full animate-bounce [animation-delay:-0.3s]" />
+                    <span className="w-2 h-2 bg-accent-text/70 rounded-full animate-bounce [animation-delay:-0.15s]" />
+                    <span className="w-2 h-2 bg-accent-text/70 rounded-full animate-bounce" />
+                  </span>
+                  <span className="text-xs text-muted">Checking the knowledge base…</span>
                 </div>
               </div>
-            ))}
-            {isBusy && (
-              <div className="flex justify-start">
-                <div className="bg-white border border-gray-200 rounded-2xl px-4 py-3 flex gap-1">
-                  <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.3s]" />
-                  <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
-                  <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" />
+            )}
+            {error && !isBusy && (
+              <div className="flex items-start gap-3 animate-fade-in-up">
+                <div className="flex items-center justify-center w-8 h-8 rounded-full bg-red-500/10 text-red-400 ring-1 ring-red-500/30 shrink-0">
+                  <CircleAlert size={16} />
+                </div>
+                <div className="rounded-2xl rounded-tl-md border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+                  <p className="font-medium">Hmm, something went wrong on my end.</p>
+                  <p className="text-xs text-red-300/80 mt-0.5">
+                    It&apos;s probably a temporary hiccup. Give it another try.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => regenerate()}
+                    className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-red-500/40 px-2.5 py-1 text-xs font-medium text-red-200 hover:bg-red-500/20 transition-colors"
+                  >
+                    <RotateCcw size={12} /> Try again
+                  </button>
                 </div>
               </div>
             )}
@@ -242,25 +1022,79 @@ function ChatPanel({
         )}
       </main>
 
-      <form onSubmit={handleSubmit} className="border-t border-gray-200 bg-white p-3 shrink-0">
-        <div className="max-w-3xl mx-auto flex items-center gap-2">
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Describe the ticket issue..."
-            className="flex-1 border border-gray-300 rounded-full px-4 py-2.5 text-sm focus:outline-none focus:border-crimson"
-            disabled={isBusy}
-          />
-          <button
-            type="submit"
-            disabled={isBusy || !input.trim()}
-            className="bg-crimson text-white rounded-full p-2.5 disabled:opacity-40 hover:bg-burgundy transition-colors"
-            aria-label="Send message"
-          >
-            {isBusy ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
-          </button>
-        </div>
-      </form>
+      {feedbackKey && (
+        <FeedbackPopup
+          key={feedbackKey}
+          conversationId={conversationId}
+          onClose={() => setFeedbackKey(null)}
+          raised={suggestions.length > 0}
+        />
+      )}
+
+      <div className="bg-canvas shrink-0">
+        {(suggestionsLoading || suggestions.length > 0) && (
+          <div className="max-w-3xl mx-auto px-3 pt-3">
+            {suggestionsLoading ? (
+              <p className="flex items-center gap-1.5 text-[11px] text-faint">
+                <Loader2 size={11} className="animate-spin" /> Finding quick replies…
+              </p>
+            ) : (
+              <div className="flex flex-wrap items-center gap-2">
+                <span
+                  className="text-[11px] font-medium uppercase tracking-wider text-faint"
+                  title="Press the number key, or Esc to clear the input"
+                >
+                  Quick reply
+                </span>
+                {suggestions.map((s, i) => (
+                  <button
+                    key={s}
+                    type="button"
+                    onClick={() => send(s)}
+                    title={`Press ${i + 1}`}
+                    className="group flex items-center gap-1.5 rounded-full border border-line-strong pl-1.5 pr-3 py-1.5 text-xs text-fg bg-surface hover:border-accent-text/60 hover:bg-accent/15 transition-colors"
+                  >
+                    <span className="flex items-center justify-center w-4 h-4 rounded-full bg-elevated text-[10px] font-medium text-muted group-hover:bg-accent group-hover:text-white transition-colors">
+                      {i + 1}
+                    </span>
+                    {s}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit} className="px-3 pt-3 pb-2">
+          <div className="max-w-3xl mx-auto flex items-end gap-2 rounded-2xl border border-line-strong bg-surface pl-4 pr-1.5 py-1.5 shadow-lg shadow-black/30 focus-within:border-accent-text/50 focus-within:ring-2 focus-within:ring-accent/20 transition-shadow">
+            <textarea
+              ref={textareaRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleInputKeyDown}
+              rows={1}
+              autoFocus
+              placeholder={
+                messages.length === 0 ? 'What is the caller running into?' : 'Add details or ask a follow-up…'
+              }
+              aria-label="Message"
+              className="flex-1 resize-none bg-transparent py-2 text-sm leading-relaxed text-fg focus:outline-none placeholder:text-faint"
+            />
+            <button
+              type="submit"
+              disabled={isBusy || !input.trim()}
+              className="bg-accent text-white rounded-xl p-2.5 disabled:bg-elevated disabled:text-faint hover:bg-accent-hover transition-colors shrink-0"
+              aria-label="Send message"
+            >
+              {isBusy ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
+            </button>
+          </div>
+          <p className="max-w-3xl mx-auto mt-2 text-center text-[11px] text-faint">
+            <kbd className="font-sans">Enter</kbd> to send · <kbd className="font-sans">Shift + Enter</kbd> for a new
+            line · Always double-check steps before sharing with a caller
+          </p>
+        </form>
+      </div>
     </>
   );
 }

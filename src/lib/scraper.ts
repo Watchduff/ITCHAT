@@ -8,6 +8,7 @@ const REQUEST_DELAY_MS = 500;
 const MAX_PAGES = Number(process.env.SCRAPER_MAX_PAGES ?? 500);
 
 export interface ScrapedArticle {
+  source: 'kb' | 'oit';
   url: string;
   title: string;
   category: string;
@@ -40,11 +41,11 @@ function isCrawlableUrl(url: string): boolean {
   return isArticleUrl(url) || /\/KB\/Category\/\d+/.test(url) || url === `${BASE_URL}${KB_PATH_PREFIX}`.replace(/\/$/, '');
 }
 
-function delay(ms: number) {
+export function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchPage(url: string): Promise<string | null> {
+export async function fetchPage(url: string): Promise<string | null> {
   try {
     const res = await axios.get(url, {
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; IT-KB-Ingest-Bot/1.0)' },
@@ -71,7 +72,7 @@ function extractArticle(html: string, url: string): ScrapedArticle | null {
   const content = bodyEl.text().replace(/\s+/g, ' ').trim();
   if (!content) return null;
 
-  return { url, title, category, content };
+  return { source: 'kb', url, title, category, content };
 }
 
 function extractLinks(html: string): string[] {
